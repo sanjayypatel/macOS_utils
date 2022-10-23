@@ -1,7 +1,7 @@
 #!/bin/zsh
 # Written by Sanjay patel
 # Updated 2022-06-07
-# RUN WITH SUDO
+# Run without sudo
 # Create a user using sysadminctl and createhomedir
 # Runs interactively at command line. Does not need GUI session.
 
