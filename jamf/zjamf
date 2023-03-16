@@ -4,12 +4,11 @@
 ##### Variables
 jamf_url=$( /usr/bin/defaults read /Library/Preferences/com.jamfsoftware.jamf.plist jss_url )
 token_file="$HOME/.jamf_token.plist"
-defaults write $token_file tokenContinue -string "false"
 udid=$( /usr/sbin/ioreg -rd1 -c IOPlatformExpertDevice | awk '/IOPlatformUUID/ { split($0, line, "\""); printf("%s\n", line[4]); }' )
 
 ##### Functions
 
-# curl Functions
+# Generic curl Functions
 curl_post_Jamf(){
     api_endpoint="${1}"
     token=$( defaults read $token_file token)
@@ -26,7 +25,17 @@ curl_get_Jamf(){
     -H "authorization: Bearer ${token}" \
     -X GET
 }
+curl_get_Jamf_json(){
+    api_endpoint="${1}"
+    token=$( defaults read $token_file token)
+    /usr/bin/curl -s \
+    -k "${jamf_url}${api_endpoint}" \
+    -H "authorization: Bearer ${token}" \
+    -H "accept: application/json" \
+    -X GET
+}
 
+# Jamf token handling
 get_jamf_token() {
     # Prompt for authentication
     echo "===== ===== ===== ===== ====="
@@ -37,30 +46,29 @@ get_jamf_token() {
     read -s input_jamf_password
     # encode credentials for subsequent token request
     encoded_credentials=$( printf "$input_jamf_user:$input_jamf_password" | /usr/bin/iconv -t ISO-8859-1 | /usr/bin/base64 -i - )
-    # Use our base64 creds to generate a temporary API access token in JSON form
-    # Use tr to strip out line feeds or the JXA will not like the input
-    # Retrieve the read token from the JSON response
-    json_response=$( /usr/bin/curl -s "${jamf_url}api/v1/auth/token" -H "authorization: Basic ${encoded_credentials}" -X POST | tr -d "\n" )
-    token=$( /usr/bin/osascript -l 'JavaScript' -e "JSON.parse(\`$json_response\`).token" )
-    token_expiration=$( /usr/bin/osascript -l 'JavaScript' -e "JSON.parse(\`$json_response\`).expires" | sed 's/\..*//' )
-    # convert the expiration time to Unix Epoch
+    # Get bearer token from Jamf Server
+    token_json=$( /usr/bin/curl -s "${jamf_url}api/v1/auth/token" -H "authorization: Basic ${encoded_credentials}" -X POST | tr -d "\n" )
+    token=$( /usr/bin/osascript -l 'JavaScript' -e "JSON.parse(\`$token_json\`).token" )
+    token_expiration=$( /usr/bin/osascript -l 'JavaScript' -e "JSON.parse(\`$token_json\`).expires" | sed 's/\..*//' )
     token_expiration_epoch=$( TZ=UTC0 date -j -f "%Y-%m-%dT%T" "$token_expiration" +"%s" )
+    # Write token and expiration epoch to token file for future executions
     defaults write $token_file token -string "$token"
     defaults write $token_file expiration -string "$token_expiration_epoch"
 }
-
 is_token_valid() {
     # Verify if token file exists
-    if [ ! -f $token_file ]
+    if [[ ! -f $token_file ]]
     then
         echo "Token file not found. Getting a new token."
+        # Default token file to not allow token continue
         defaults write $token_file tokenContinue -string "false"
+        defaults write $token_file token -string ""
+        defaults write $token_file expiration -string "0"
         get_jamf_token
     fi
     # If token exists, check expiration
     now_epoch=$( date +%s )
     expiration_epoch=$( defaults read $token_file expiration )
-
     if [ $expiration_epoch -lt $now_epoch ]
     then
         echo "Token expired. Getting a new token."
@@ -70,33 +78,62 @@ is_token_valid() {
     fi
 
 }
-
 invalidate_jamf_token() {
-    curl_post_Jamf "api/v1/auth/invalidate-token"
-    echo "Token invalidated. Removing token file."
-    rm $token_file
+    token_continue=$( defaults read $token_file tokenContinue )
+    if [[ "$token_continue" == "false" ]]
+    then
+        curl_post_Jamf "api/v1/auth/invalidate-token"
+        # Set empty values in token file
+        defaults write $token_file token -string ""
+        defaults write $token_file expiration -string "0"
+    fi
 }
 
+# Jamf API functions
 get_jamf_version() {
-    json_response=$( curl_get_Jamf "api/v1/jamf-pro-version" )
-    version=$( /usr/bin/osascript -l 'JavaScript' -e "JSON.parse(\`$json_response\`).version" )
+    version_json=$( curl_get_Jamf "api/v1/jamf-pro-version" )
+    version=$( /usr/bin/osascript -l 'JavaScript' -e "JSON.parse(\`$version_json\`).version" )
     echo "Jamf Version"
     echo $version
 }
-
 get_jamf_computer_id() {
-    json_response=$( curl_get_Jamf "api/v1/computers-inventory?section=USER_AND_LOCATION&filter=udid%3D%3D%22${udid}%22" )
-    #echo $json_response
-    computer_id=$( /usr/bin/osascript -l 'JavaScript' -e "JSON.parse(\`$json_response\`).results[0].id" )
-    user_and_location=$( /usr/bin/osascript -l 'JavaScript' -e "JSON.parse(\`$json_response\`).results[0].userAndLocation" )
+    computer_json=$( curl_get_Jamf "api/v1/computers-inventory?section=USER_AND_LOCATION&filter=udid%3D%3D%22${udid}%22" )
+    computer_id=$( /usr/bin/osascript -l 'JavaScript' -e "JSON.parse(\`$computer_json\`).results[0].id" )
     echo "Computer Info:"
-    echo "$user_and_location"
+    echo "$Computer ID: $computer_id"
+}
+find_jamf_event() {
+    # Outputs Jamf Custom Event Triggers for policies that match a search term
+    search_term="$*"
+    policies=$( curl_get_Jamf_json "JSSResource/policies" )
+    # Cleanup policies
+    policies="${policies#{\"policies\":\[\{}"
+    policies="${policies%\}\]\}}"
+    policies=$( echo "$policies" | sed s/},{/\\n/g  )
+    # filter policies by search term
+    filtered_policies=$( echo "$policies" | grep -i "$search_term")
+    # strip down to ids
+    policy_ids=$( echo "$filtered_policies" | awk -F: '{print $2}' | awk -F, '{print $1}' )
+    # Loop through policies to get specific custom events
+    echo "Events matching $search_term (enabled only):"
+    while IFS= read -r policy_id
+    do
+        policy=$( curl_get_Jamf_json "JSSResource/policies/id/${policy_id}/subset/General" )
+        event=$( /usr/bin/osascript -l 'JavaScript' -e "JSON.parse(\`$policy\`).policy.general.trigger_other" )
+        event=$( echo $event | tr '[:upper:]' '[:lower:]' )
+        enabled=$( /usr/bin/osascript -l 'JavaScript' -e "JSON.parse(\`$policy\`).policy.general.enabled" )
+        if [[ "$event" == *"$search_term"*  && "$enabled" == "true" ]]; then
+            echo "$event"
+        fi
+    done <<< "$policy_ids"
+    echo "You can run these with 'jamf policy -event' command"
 }
 
+##### Command Execution
 # Initial Token Check
 is_token_valid
-
-while getopts ":vct" option; do
+# Parse options
+while getopts "e:vct" option; do
     case $option in
         t) # do not invalidate token after running
             defaults write $token_file tokenContinue -string "true"
@@ -104,18 +141,17 @@ while getopts ":vct" option; do
         v) # Jamf Version
             get_jamf_version
             ;;
-        c) # Get this computer ID from Jamf
+        c) # Get this computer info from Jamf
             get_jamf_computer_id
+            ;;
+        e) # find custom events
+            find_jamf_event $OPTARG
             ;;
         \?) # incorrect option
             echo "Error: Invalid option"
+            invalidate_jamf_token
             exit 1;;
     esac
 done
-
-# Check if token is allowed to continue
-token_continue=$( defaults read $token_file tokenContinue )
-if [[ "$token_continue" == "false" ]]
-then
-    invalidate_jamf_token
-fi
+# Invalidate the token if needed
+invalidate_jamf_token
