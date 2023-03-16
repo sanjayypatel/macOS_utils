@@ -1,4 +1,4 @@
-# sanjayypatel/macOS_utils_
+# sanjayypatel/macOS_utils
 
 ## Scripts for macOS management tasks.  Many interface with Jamf management.
 
